@@ -3,12 +3,12 @@
 const int sensorPins[6] = {A0, A1, A2, A3, A4, A5};
 
 // TB6612FNG Pins
-const int PWMA = 5;  // Left Motor Speed
-const int AIN1 = 6;  // Left Motor Dir 1
-const int AIN2 = 7;  // Left Motor Dir 2
-const int PWMB = 10; // Right Motor Speed
-const int BIN1 = 8;  // Right Motor Dir 1
-const int BIN2 = 9;  // Right Motor Dir 2
+const int PWMA = 10;  // Left Motor Speed
+const int AIN1 = 8;  // Left Motor Dir 1
+const int AIN2 = 9;  // Left Motor Dir 2
+const int PWMB = 5; // Right Motor Speed
+const int BIN1 = 7;  // Right Motor Dir 1
+const int BIN2 = 6;  // Right Motor Dir 2
 const int STBY = 4;  // Standby pin
 
 // UI Pins
