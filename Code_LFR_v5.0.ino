@@ -34,21 +34,21 @@ const int LINE_CENTER = 2500;           // The ideal center position for the PID
 // --- MOVEMENT TIMERS (ms) ---
 const int TIME_CROSSROAD_PUSH = 50;     // Pushing forward to verify a crossroad
 const int TIME_TURN_ALIGN = 30;         // Pushing forward before pivoting 
-const int TIME_UTURN_DELAY = 100;       // Buffer before scanning for the line on a 180
-const int TIME_SPIN_TIMEOUT = 1000;     // Max time allowed to spin before killing motors
-const unsigned long gapTime = 150;      // Max time allowed to coast over a dashed line
+const int TIME_UTURN_DELAY = 120;       // Buffer before scanning for the line on a 180
+const int TIME_SPIN_TIMEOUT = 2000;     // Max time allowed to spin before killing motors
+const unsigned long gapTime = 100;      // Max time allowed to coast over a dashed line
 
 // --- MOVEMENT SPEEDS ---
-const int SPEED_CROSSROAD_CHECK = 100;  // Speed when creeping forward to check intersections
-const int SPEED_TURN = 150;             // Speed used for hard left/right pivots
-const int baseSpeed = 150;              // Target 0.6 - 0.8 m/s
-const int maxSpeed = 255;
+const int SPEED_CROSSROAD_CHECK = 80;  // Speed when creeping forward to check intersections
+const int SPEED_TURN = 120;             // Speed used for hard left/right pivots
+const int baseSpeed = 120;              // Target 0.6 - 0.8 m/s
+const int maxSpeed = 240;
 
 // State Machine
 int currentState = 0; // 0 = Calib Idle, 1 = Run Idle
 bool isRunning = false;
 bool isCalibrating = false;
-
+bool isInverted = false;
 // Button Debouncing & Edge Detection (millis)
 unsigned long lastModeDebounce = 0;
 unsigned long lastConfirmDebounce = 0;
@@ -65,7 +65,7 @@ long Kd = 20000; // equivalent to 20.0
 long lastError = 0;
 
 // Calibration Settings
-int calibSpeed = 150;           // Motor speed during calibration spin
+int calibSpeed = 100;           // Motor speed during calibration spin
 unsigned long calibTime = 3000; // Time (in ms) to complete two full 360-degree spins
 
 // Macros for fast ADC
@@ -75,8 +75,8 @@ unsigned long calibTime = 3000; // Time (in ms) to complete two full 360-degree 
 void setup() {
   // 1. Overclock the ADC
   sbi(ADCSRA, ADPS2);
-  cbi(ADCSRA, ADPS1);
-  sbi(ADCSRA, ADPS0);
+  sbi(ADCSRA, ADPS1);
+  cbi(ADCSRA, ADPS0);
 
   // 2. Pin Modes
   for (int i = 0; i < 6; i++) pinMode(sensorPins[i], INPUT);
@@ -164,10 +164,27 @@ void loop() {
 
 void executeRaceLogic() {
   long position = readLine();
-
-  // 1. MEMORY: Snapshot the intersection BEFORE pushing forward
-  bool leftWasBlack = (sensorValues[0] > THRESHOLD_INTERSECTION);
-  bool rightWasBlack = (sensorValues[5] > THRESHOLD_INTERSECTION);
+  // Check for Inverted line
+  if (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[5] > THRESHOLD_INTERSECTION && 
+      sensorValues[2] < 300 && sensorValues[3] < 300) {
+    
+    // Quick 5ms debounce delay and re-read to confirm it isn't transient noise
+    delay(5);
+    readLine();
+    
+    if (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[5] > THRESHOLD_INTERSECTION && 
+        sensorValues[2] < 300 && sensorValues[3] < 300) {
+      
+      isInverted = !isInverted; // Instantly flip the mapping polarity
+      return; // Exit this loop cycle; next frame will calculate using the corrected mapping
+    }
+  }
+  // Snapshot the intersection BEFORE pushing forward
+  // --- ZIGZAG OPTIMIZATION ---
+  // Require BOTH the outer and adjacent sensors to see black to trigger a junction.
+  // This prevents normal wide swings on a zigzag from killing my PD loop momentum.
+  bool leftWasBlack = (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[1] > THRESHOLD_INTERSECTION);
+  bool rightWasBlack = (sensorValues[5] > THRESHOLD_INTERSECTION && sensorValues[4] > THRESHOLD_INTERSECTION);
 
   // --- INTERSECTION DETECTION ---
   if (leftWasBlack || rightWasBlack) {
@@ -271,7 +288,14 @@ int readCalibratedSensor(int index, int rawVal = -1) {
     rawVal = analogRead(sensorPins[index]);
   }
   
-  int val = map(rawVal, sensorMin[index], sensorMax[index], 1000, 0);
+  int val;
+  if (isInverted) {
+    // INVERTED TRACK: Black = 0, White = 1000
+    val = map(rawVal, sensorMin[index], sensorMax[index], 0, 1000);
+  } else {
+    // NORMAL TRACK: Black = 1000, White = 0
+    val = map(rawVal, sensorMin[index], sensorMax[index], 1000, 0);
+  }
   return constrain(val, 0, 1000);
 }
 
@@ -328,18 +352,24 @@ void calibrateSensors() {
 // MOTOR CONTROL
 
 void moveMotors(int leftSpeed, int rightSpeed) {
+  // Swapped HIGH and LOW for Left Motor
   if (leftSpeed >= 0) {
-    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    digitalWrite(AIN1, LOW); 
+    digitalWrite(AIN2, HIGH);
   } else {
-    digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+    digitalWrite(AIN1, HIGH); 
+    digitalWrite(AIN2, LOW);
     leftSpeed = -leftSpeed;
   }
   analogWrite(PWMA, leftSpeed);
 
+  // Swapped HIGH and LOW for Right Motor
   if (rightSpeed >= 0) {
-    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+    digitalWrite(BIN1, LOW); 
+    digitalWrite(BIN2, HIGH);
   } else {
-    digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
     rightSpeed = -rightSpeed;
   }
   analogWrite(PWMB, rightSpeed);
