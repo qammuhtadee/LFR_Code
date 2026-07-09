@@ -3,18 +3,18 @@
 const int sensorPins[6] = {A0, A1, A2, A3, A4, A5};
 
 // TB6612FNG Pins
-const int PWMA = 10; // Left Motor Speed
-const int AIN1 = 8;  // Left Motor Dir 1
-const int AIN2 = 9;  // Left Motor Dir 2
+const int PWMA = 11; // Left Motor Speed
+const int AIN1 = 9;  // Left Motor Dir 1
+const int AIN2 = 10;  // Left Motor Dir 2
 const int PWMB = 5;  // Right Motor Speed
 const int BIN1 = 7;  // Right Motor Dir 1
 const int BIN2 = 6;  // Right Motor Dir 2
-const int STBY = 4;  // Standby pin
+const int STBY = 8;  // Standby pin
 
 // UI Pins
-const int BTN_MODE = 2;
-const int BTN_CONFIRM = 3;
-const int LED_CALIB = 11;
+const int BTN_MODE = 3;
+const int BTN_CONFIRM = 2;
+const int LED_CALIB = 4;
 const int LED_RUN = 12;
 const int LED_ACTIVE = 13;
 
@@ -26,7 +26,7 @@ int sensorValues[6];
 // --- WIDENED SENSOR THRESHOLDS (Docile Mode) ---
 const int THRESHOLD_INTERSECTION = 650; 
 const int THRESHOLD_TURN = 450;         
-const int THRESHOLD_LINE = 100;         
+const int THRESHOLD_LINE = 160;         
 const int LINE_CENTER = 2500;           
 
 // --- MOVEMENT TIMERS (ms) ---
@@ -39,8 +39,8 @@ const int TIME_SPIN_TIMEOUT = 2500;
 // --- MOVEMENT SPEEDS (Tank Mode) ---
 const int SPEED_CREEP = 70;         // Braking zone speed
 const int SPEED_TURN = 110;         // Controlled pivot speed
-const int baseSpeed = 100;          // Target 0.5 - 0.6 m/s
-const int maxSpeed = 160;           // Capped maximum
+const int baseSpeed = 120;          // Target 0.5 - 0.6 m/s
+const int maxSpeed = 240;           // Capped maximum
 
 // --- STATE MACHINE (The Maze Brain) ---
 int currentState = 0; 
@@ -59,8 +59,8 @@ int lastConfirmState = HIGH, currentConfirmState = HIGH;
 
 // --- DOCILE PD LOOP TUNING ---
 // Kp is slightly stronger to hug the line, Kd is slashed to stop twitching
-long Kp = 2000;  // 2.0
-long Kd = 8000;  // 8.0
+long Kp = 50;
+long Kd = 800;
 long lastError = 0;
 
 int calibSpeed = 90;
@@ -82,12 +82,48 @@ void setup() {
   EEPROM.get(0, sensorMin);
   EEPROM.get(12, sensorMax);
 
+  // EEPROM SANITY CHECK
+  bool isCalibValid = true;
+  for (int i = 0; i < 6; i++) {
+    // If maximum is less than minimum or values are out-of-bounds, data is garbage
+    if (sensorMax[i] <= sensorMin[i] || sensorMin[i] < 0 || sensorMax[i] > 1023) {
+      isCalibValid = false;
+    }
+  }
+
+  // If validation fails, force a middle-ground profile so the map() function doesn't crash
+  if (!isCalibValid) {
+    for (int i = 0; i < 6; i++) {
+      sensorMin[i] = 100;   // Baseline white floor
+      sensorMax[i] = 900;   // Baseline black tape
+    }
+    // Rapid alert flash on the calibration LED to tell you to run manual calibration
+    for (int k = 0; k < 8; k++) {
+      digitalWrite(LED_CALIB, HIGH); delay(60);
+      digitalWrite(LED_CALIB, LOW);  delay(60);
+    }
+  }
+
   digitalWrite(LED_CALIB, HIGH);
   digitalWrite(LED_RUN, LOW);
   digitalWrite(LED_ACTIVE, LOW);
+  
 }
 
 void loop() {
+  // 1. RUNTIME KILL-SWITCH (Highest Priority)
+  // If the bot is running and you press the Confirm button, execute an instant hard stop.
+  if (isRunning) {
+    if (digitalRead(BTN_CONFIRM) == LOW) {
+      stopMotors();
+      isRunning = false;
+      digitalWrite(LED_ACTIVE, LOW);
+      delay(500); // Safety window to prevent instant re-triggering
+      return;
+    }
+  }
+
+  // 2. STANDARD MENU NAVIGATION (Only active when stationary)
   if (!isRunning && !isCalibrating) {
     int readingMode = digitalRead(BTN_MODE);
     if (readingMode != lastModeState) { lastModeDebounce = millis(); }
@@ -119,9 +155,15 @@ void loop() {
             digitalWrite(LED_CALIB, LOW);
             digitalWrite(LED_RUN, HIGH);
           } else {
+            // SAFE STATE INITIALIZATION (Flushes stale memory states between runs)
+            isBacktracking = false;
+            inDetour = false;
+            isInverted = false;
+            lastError = 0;
+
             isRunning = true;
             digitalWrite(LED_ACTIVE, HIGH);
-            delay(500); 
+            delay(500);
           }
         }
       }
@@ -129,6 +171,7 @@ void loop() {
     lastConfirmState = readingConfirm;
   }
 
+  // 3. MAIN LOGIC EXECUTION STEP
   if (isRunning) {
     executeRaceLogic();
   }
@@ -137,87 +180,90 @@ void loop() {
 void executeRaceLogic() {
   long position = readLine();
 
-  // 1. INVERTED TRACK CHECK
+  // Count exactly how many sensors see the line
+  int activeSensors = 0;
+  for(int i = 0; i < 6; i++) {
+    if(sensorValues[i] > THRESHOLD_INTERSECTION) {
+      activeSensors++;
+    }
+  }
+
+  // 1. INVERTED TRACK CHECK (DISABLED FOR SAFETY)
+  // Unless your track explicitly features white lines on black floors, keep this disabled.
+  // It shares the exact same sensor signature as a wide Y-fork and will cause false triggers.
+  /*
   if (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[5] > THRESHOLD_INTERSECTION && 
       sensorValues[2] < 300 && sensorValues[3] < 300) {
     delay(5); readLine();
     if (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[5] > THRESHOLD_INTERSECTION && 
         sensorValues[2] < 300 && sensorValues[3] < 300) {
-      isInverted = !isInverted;
-      return; 
+      isInverted = !isInverted; return; 
     }
   }
+  */
 
-  // 2. ACUTE ANGLE SWEEP (Widened High-Speed Net)
-  // If the center is lost, but ANY outer sensor spikes, brake and pivot
-  if (sensorValues[2] < THRESHOLD_LINE && sensorValues[3] < THRESHOLD_LINE) {
-    
-    // Check both inner [1] and extreme outer [0] for Left Sweep
+  // 2. ACUTE ANGLE SWEEP (Gated for Safety)
+  // Only allowed to fire if it is a thin line (2 or fewer sensors active). 
+  // If 3+ sensors are active, it's a junction, let the Blob Detector handle it.
+  if (activeSensors <= 2 && sensorValues[2] < THRESHOLD_LINE && sensorValues[3] < THRESHOLD_LINE) {
     if (sensorValues[1] > THRESHOLD_TURN || sensorValues[0] > THRESHOLD_TURN) {
-      executeTurn('A', 'L'); 
-      return;
+      executeTurn('A', 'L'); return;
     } 
-    // Check both inner [4] and extreme outer [5] for Right Sweep
     else if (sensorValues[4] > THRESHOLD_TURN || sensorValues[5] > THRESHOLD_TURN) {
-      executeTurn('A', 'R'); 
-      return;
+      executeTurn('A', 'R'); return;
     }
   }
 
   // 3. INTERSECTION DETECTION (The Braking Zone)
-  bool leftWasBlack = (sensorValues[0] > THRESHOLD_INTERSECTION && sensorValues[1] > THRESHOLD_INTERSECTION);
-  bool rightWasBlack = (sensorValues[5] > THRESHOLD_INTERSECTION && sensorValues[4] > THRESHOLD_INTERSECTION);
+  bool leftWasBlack = (sensorValues[0] > THRESHOLD_INTERSECTION || sensorValues[1] > THRESHOLD_INTERSECTION);
+  bool rightWasBlack = (sensorValues[5] > THRESHOLD_INTERSECTION || sensorValues[4] > THRESHOLD_INTERSECTION);
 
-  if (leftWasBlack || rightWasBlack) {
+  if (leftWasBlack || rightWasBlack || activeSensors >= 3) {
     
-    // ACTIVE BRAKING: Kill the 16 GA motor inertia instantly
-    moveMotors(-50, -50); 
+    // ACTIVE BRAKING
+    moveMotors(-50, -50);
     delay(TIME_BRAKE);
     
-    // --- THE SMART LEVER ARM PUSH (Trap Immunity) ---
-    // Instead of a blind delay, we actively scan the track while creeping 18cm.
+    // THE SMART LEVER ARM PUSH (Trap Immunity)
     unsigned long pushTimer = millis();
     unsigned long lineLostTimer = 0;
     bool currentlyLost = false;
     bool straightIsTrap = false;
 
-    moveMotors(SPEED_CREEP, SPEED_CREEP); // Start the 18cm push
+    moveMotors(SPEED_CREEP, SPEED_CREEP);
     
     while (millis() - pushTimer < TIME_ALIGN_LEVER) {
-      long currentPos = readLine(); // Continuously scan
-      
-      if (currentPos == -1) {
-        // The line is gone. Start the gap timer.
+      if (readLine() == -1) {
         if (!currentlyLost) {
           currentlyLost = true;
           lineLostTimer = millis();
         } else if (millis() - lineLostTimer > TIME_GAP_COAST) {
-          // We have driven over 5cm of pure white space during the push!
-          // We caught the 15cm illegal island gap.
-          straightIsTrap = true;
+          straightIsTrap = true; // Caught the 15cm illegal island
         }
       } else {
-        // We found the line again (could be a legal short dash). Reset timer.
         currentlyLost = false; 
       }
     }
     
-    // The 18cm push is finished. Take the final snapshot.
+    // Final snapshot after the 18cm push
     position = readLine();
     
-    bool straightExists = (sensorValues[2] > THRESHOLD_LINE || sensorValues[3] > THRESHOLD_LINE);
-    bool stillLeft = (sensorValues[0] > THRESHOLD_INTERSECTION);
-    bool stillRight = (sensorValues[5] > THRESHOLD_INTERSECTION);
-
-    // --- THE TRAP OVERRIDE ---
-    // If the 5cm white-space limit was breached during the push, destroy the Straight option.
-    if (straightIsTrap) {
-      straightExists = false; 
-      inDetour = true; // Raise the flag
+    // Recalculate active sensors for the Stop Box check
+    int postPushSensors = 0;
+    for(int i = 0; i < 6; i++) {
+      if(sensorValues[i] > THRESHOLD_INTERSECTION) postPushSensors++;
     }
 
-    // A. STOP BOX
-    if (leftWasBlack && rightWasBlack && straightExists && stillLeft && stillRight) {
+    bool straightExists = (sensorValues[2] > THRESHOLD_LINE || sensorValues[3] > THRESHOLD_LINE);
+    
+    // THE TRAP OVERRIDE
+    if (straightIsTrap) {
+      straightExists = false; 
+      inDetour = true;
+    }
+
+    // A. STOP BOX (Requires 5 or 6 sensors completely saturated after the push)
+    if (postPushSensors >= 5) {
       stopMotors();
       isRunning = false; 
       digitalWrite(LED_ACTIVE, LOW);
@@ -227,61 +273,51 @@ void executeRaceLogic() {
     // B. THE MAZE SOLVER (Straight Priority w/ Backtrack Memory)
     if (straightExists) {
       if (isBacktracking) {
-        // We hit a dead end and U-turned. "Straight" is where we came from!
-        // Ignore straight and process Right-Hand Rule.
         if (rightWasBlack) { 
           executeTurn('J', 'R'); 
-          isBacktracking = false; // Reset memory
-          return; 
+          isBacktracking = false; return;
         }
         else if (leftWasBlack) { 
-          executeTurn('J', 'L'); 
-          isBacktracking = false; // Reset memory
-          return; 
+          executeTurn('J', 'L');
+          isBacktracking = false; return;
         }
       } else {
-        // Normal Straight Priority. Let PID handle it.
-        return;
+        return; // Normal Straight Priority
       }
     }
 
-    // C. DETOUR EXIT OVERRIDE ---
-    // If we are in a detour, and hit a T-Junction (Left + Right, no Straight)
+    // C. DETOUR EXIT OVERRIDE
     if (inDetour && !straightExists && leftWasBlack && rightWasBlack) {
-      executeTurn('J', 'L'); // Force Left to rejoin the main track
-      inDetour = false;      // Detour complete, drop the flag
+      executeTurn('J', 'L');
+      inDetour = false; 
+      isBacktracking = false; // Fixed: Prevent flag leakage
       return;
     }
 
     // D. RIGHT-HAND PRIORITY
     if (rightWasBlack) {
       executeTurn('J', 'R');
-      isBacktracking = false;
-      return;
+      isBacktracking = false; return;
     }
 
-    // E. LEFT CORNERS (Lowest Priority)
+    // E. LEFT CORNERS
     if (leftWasBlack) {
       executeTurn('J', 'L');
-      isBacktracking = false;
-      return;
+      isBacktracking = false; return;
     }
   }
 
   // 4. GAP & DEAD-END VERIFIER
   if (position == -1) { 
-    moveMotors(SPEED_CREEP, SPEED_CREEP); // Drop to 6cm coast speed
+    moveMotors(SPEED_CREEP, SPEED_CREEP);
     unsigned long creepTimer = millis();
-    
     while (readLine() == -1) {
       if (millis() - creepTimer > TIME_GAP_COAST) { 
-        // 6cm crossed without finding a line. True Dead End.
         executeTurn('U', 'U');
-        isBacktracking = true; // Raise the Maze Solver flag!
+        isBacktracking = true; 
         return;
       }
     }
-    // Loop broke? It was a dashed line. Resume normal driving.
     return;
   }
 
@@ -289,7 +325,6 @@ void executeRaceLogic() {
   long error = position - LINE_CENTER;
   long motorSpeed = (Kp * error + Kd * (error - lastError)) / 1000;
   lastError = error;
-
   int leftMotorSpeed = constrain(baseSpeed + motorSpeed, -255, maxSpeed);
   int rightMotorSpeed = constrain(baseSpeed - motorSpeed, -255, maxSpeed);
   moveMotors(leftMotorSpeed, rightMotorSpeed);
@@ -358,13 +393,12 @@ void stopMotors(){
 
 void executeTurn(char type, char dir){
   unsigned long turnTimer = millis();
-
-  // TYPE 'A': Acute Angles (Pivot slightly slower to avoid overshooting)
+  
+  // TYPE 'A': Acute Angles
   if (type == 'A') {
     if (dir == 'L') { moveMotors(-SPEED_TURN, SPEED_TURN); }
     else if (dir == 'R') { moveMotors(SPEED_TURN, -SPEED_TURN); }
     
-    // Just lock onto the line instantly, no need to clear an intersection line
     while (readCalibratedSensor(2) < THRESHOLD_TURN && readCalibratedSensor(3) < THRESHOLD_TURN) {
       if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
     }
@@ -374,25 +408,33 @@ void executeTurn(char type, char dir){
   else {
     if (dir == 'L') {
       moveMotors(-SPEED_TURN, SPEED_TURN);
-      while (readCalibratedSensor(0) > THRESHOLD_TURN && readCalibratedSensor(1) > THRESHOLD_TURN) {} // Clear horizontal
+      // STAGE 1: Wait until the left side of the blob clears completely
+      while (readCalibratedSensor(0) > THRESHOLD_TURN || readCalibratedSensor(1) > THRESHOLD_TURN) {
+        if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
+      } 
+      // STAGE 2: Lock onto the new line
       while (readCalibratedSensor(2) < THRESHOLD_TURN && readCalibratedSensor(3) < THRESHOLD_TURN) {
         if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
       }
     } else if (dir == 'R') {
       moveMotors(SPEED_TURN, -SPEED_TURN);
-      while (readCalibratedSensor(4) > THRESHOLD_TURN && readCalibratedSensor(5) > THRESHOLD_TURN) {} 
+      // STAGE 1: Wait until the right side of the blob clears completely
+      while (readCalibratedSensor(4) > THRESHOLD_TURN || readCalibratedSensor(5) > THRESHOLD_TURN) {
+        if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
+      } 
+      // STAGE 2: Lock onto the new line
       while (readCalibratedSensor(2) < THRESHOLD_TURN && readCalibratedSensor(3) < THRESHOLD_TURN) {
         if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
       }
     } else if (dir == 'U') {
       moveMotors(SPEED_TURN, -SPEED_TURN);
-      delay(200); // 17cm width takes longer to 180 pivot
+      delay(200); 
       while (readCalibratedSensor(2) < THRESHOLD_TURN && readCalibratedSensor(3) < THRESHOLD_TURN) {
         if (millis() - turnTimer > TIME_SPIN_TIMEOUT) { stopMotors(); isRunning = false; return; }
       }
     }
   }
   
-  stopMotors(); // Brief electromagnetic brake
+  stopMotors();
   delay(20);
 }
